@@ -1,0 +1,24 @@
+# Exclude ensemble runs entirely
+ensemble/
+
+# Common GEOS-Chem / model outputs (add/remove as needed)
+OutputDir/
+*.nc
+*.nc4
+*.bpch
+*.log
+*.err
+*.out
+*.gz
+*.tar
+*.tar.gz
+*.tmp
+
+# Python junk
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# OS junk
+.DS_Store
+WRONGLY_setUp_Ensemble

@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+# make_country_ensemble.sh
+#
+# Reads Country_Run_Manifest.csv (columns: RUNID,LIVESTOCK,MASK,COUNTRY)
+# For each row, creates: ensemble/RUNID_LIVESTOCK_COUNTRY
+# Then applies:
+#   1) Replace ALL occurrences of "1011" with MASK (4-digit string)
+#   2) In HEMCO_Config.rc: change any line that begins with
+#        "0 FAUBI_*_{LIVESTOCK} ..."
+#      to
+#        "#0 FAUBI_*_{LIVESTOCK} ..."
+
+set -euo pipefail
+
+# ---------------- Config ----------------
+# Assume this script is run from (or lives in) the run directory that contains:
+#   template/ , ensemble/ , Country_Run_Manifest.csv
+BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TEMPLATE_DIR="${BASE}/template"
+ENSEMBLE_DIR="${BASE}/ensemble"
+MANIFEST_CSV="${BASE}/Country_Run_Manifest.csv"
+HEMCO_RC_REL="HEMCO_Config.rc"
+
+copy_template() {
+  local src="$1" dst="$2"
+  mkdir -p "$dst"
+  cp -a "${src}/." "$dst"
+}
+
+trim_field() {
+  # Trim whitespace and surrounding double-quotes.
+  # Usage: trimmed="$(trim_field "$raw")"
+  local x="$1"
+  # remove CR (Windows line endings)
+  x="${x//$'\r'/}"
+  # strip surrounding quotes
+  x="${x%\"}"; x="${x#\"}"
+  # trim leading/trailing whitespace (bash-safe via xargs)
+  printf "%s" "$x" | xargs
+}
+
+# ---------------- Preflight ----------------
+if [[ ! -d "$TEMPLATE_DIR" ]]; then
+  echo "ERROR: Template dir not found: $TEMPLATE_DIR" >&2
+  exit 1
+fi
+
+if [[ ! -f "${TEMPLATE_DIR}/${HEMCO_RC_REL}" ]]; then
+  echo "ERROR: Missing ${HEMCO_RC_REL} in template: ${TEMPLATE_DIR}/${HEMCO_RC_REL}" >&2
+  exit 1
+fi
+
+if [[ ! -f "$MANIFEST_CSV" ]]; then
+  echo "ERROR: Missing manifest CSV: $MANIFEST_CSV" >&2
+  exit 1
+fi
+
+mkdir -p "$ENSEMBLE_DIR"
+
+# Require gawk (optional but recommended; standard awk is fine here too)
+if ! command -v awk >/dev/null 2>&1; then
+  echo "ERROR: awk not found on PATH." >&2
+  exit 1
+fi
+
+echo ">> BASE:         $BASE"
+echo ">> TEMPLATE_DIR: $TEMPLATE_DIR"
+echo ">> ENSEMBLE_DIR: $ENSEMBLE_DIR"
+echo ">> MANIFEST_CSV: $MANIFEST_CSV"
+echo ">> HEMCO_RC_REL: $HEMCO_RC_REL"
+echo
+
+# ---------------- Helpers: edits ----------------
+replace_1011_in_hemco_rc_only() {
+  # Replace "1011" -> "$mask" ONLY inside HEMCO_Config.rc
+  local hemco_rc="$1"
+  local mask="$2"
+
+  # sanity: mask should be exactly 4 digits
+  if [[ ! "$mask" =~ ^[0-9]{4}$ ]]; then
+    echo "ERROR: MASK must be a 4-digit code; got '$mask'." >&2
+    exit 1
+  fi
+
+  if [[ ! -f "$hemco_rc" ]]; then
+    echo "ERROR: Expected a file for hemco_rc, got: $hemco_rc" >&2
+    exit 1
+  fi
+  
+  local tmp="${hemco_rc}.tmp"
+
+  # Strip CRs, then replace *token* 1011 (not e.g. 10112)
+  tr -d '\r' < "$hemco_rc" | \
+    awk -v m="$mask" '{ gsub(/\<1011\>/, m); print }' > "$tmp"
+
+  mv "$tmp" "$hemco_rc"
+
+  if grep -n "1011" "$hemco_rc" | head; then
+      echo "ERROR: Still found 1011 in $hemco_rc after replacement" >&2
+      exit 1
+  fi
+
+}
+
+comment_faubi_lines_for_livestock() {
+  # In HEMCO_Config.rc: any line starting with "0 FAUBI_*_{livestock} ..."
+  # becomes "#0 FAUBI_*_{livestock} ..."
+  local hemco_rc="$1"
+  local livestock="$2"
+
+  local tmp="${hemco_rc}.tmp"
+
+  tr -d '\r' < "$hemco_rc" | \
+    awk -v lv="$livestock" '
+      BEGIN { changed=0 }
+      {
+        line=$0
+        # Match lines that begin with optional whitespace, then "0", then spaces, then "FAUBI_..._<LV>" token.
+        # Example: 0 FAUBI_NH3_Bf   ...  --> #0 FAUBI_NH3_Bf ...
+        if (match(line, /^[[:space:]]*0[[:space:]]+FAUBI_[^[:space:]]*_[^[:space:]]*$/, m)) {
+          # This regex is too strict (expects end-of-line). We handle with tokenization below.
+        }
+
+        n=split(line, f, /[ \t]+/)
+        # token 1 == 0, token 2 begins with FAUBI_, and token 2 ends with _<lv>
+        if (n>=2 && f[1]=="0" && f[2] ~ /^FAUBI_/ && f[2] ~ ("_" lv "$")) {
+          sub(/^[[:space:]]*0/, "#0", line)
+          changed++
+        }
+        print line
+      }
+      END {
+        if (changed < 1) exit 42
+      }
+    ' > "$tmp" || {
+      rc=$?
+      rm -f "$tmp"
+      if [[ $rc -eq 42 ]]; then
+        echo "ERROR: No lines matched for LIVESTOCK='${livestock}' in ${hemco_rc}" >&2
+        echo "HINT: Check the FAUBI tokens; expected lines like: 0 FAUBI_*_${livestock} ..." >&2
+        echo "      grep -n \"FAUBI_\" \"${hemco_rc}\" | head" >&2
+      else
+        echo "ERROR: awk rewrite failed for ${hemco_rc}" >&2
+      fi
+      exit 1
+    }
+
+  mv "$tmp" "$hemco_rc"
+}
+
+# ---------------- Build from CSV ----------------
+# Skip header row; handle simple CSV (no embedded commas in fields).
+# Columns expected: RUNID,LIVESTOCK,MASK,COUNTRY
+rownum=0
+tail -n +2 "$MANIFEST_CSV" | while IFS=, read -r RUNID LIVESTOCK MASK COUNTRY REST; do
+  # Skip blank lines
+  [[ -z "${RUNID//[[:space:]]/}" ]] && continue
+
+  RUNID="$(trim_field "${RUNID:-}")"
+  LIVESTOCK="$(trim_field "${LIVESTOCK:-}")"
+  MASK="$(trim_field "${MASK:-}")"
+  COUNTRY="$(trim_field "${COUNTRY:-}")"
+
+  if [[ -z "$RUNID" || -z "$LIVESTOCK" || -z "$MASK" || -z "$COUNTRY" ]]; then
+    echo "ERROR: Missing required field(s) in CSV row: RUNID='$RUNID' LIVESTOCK='$LIVESTOCK' MASK='$MASK' COUNTRY='$COUNTRY'" >&2
+    exit 1
+  fi
+
+  # Ensure MASK is 4 digits (allow user-provided 4-char string; if numeric shorter, zero-pad)
+  if [[ "$MASK" =~ ^[0-9]+$ ]]; then
+    MASK="$(printf "%04d" "$MASK")"
+  fi
+  if [[ ! "$MASK" =~ ^[0-9]{4}$ ]]; then
+    echo "ERROR: MASK must be a 4-digit code (got '$MASK') for RUNID='$RUNID'." >&2
+    exit 1
+  fi
+
+  rownum=$((rownum + 1))
+  dir_name="${RUNID}_${LIVESTOCK}_${COUNTRY}"
+  run_dir="${ENSEMBLE_DIR}/${dir_name}"
+
+  echo ">>> [Row ${rownum}] Creating ${run_dir}"
+  [[ -d "$run_dir" ]] && rm -rf "$run_dir"
+  copy_template "$TEMPLATE_DIR" "$run_dir"
+
+  hemco_rc="${run_dir}/${HEMCO_RC_REL}"
+  if [[ ! -f "$hemco_rc" ]]; then
+    echo "ERROR: ${HEMCO_RC_REL} missing in ${run_dir}" >&2
+    exit 1
+  fi
+
+  # (1) Replace "1011" -> MASK everywhere in the rundir
+  replace_1011_in_hemco_rc_only "$hemco_rc" "$MASK"
+
+  # (2) Comment out FAUBI lines for this LIVESTOCK in HEMCO_Config.rc
+  comment_faubi_lines_for_livestock "$hemco_rc" "$LIVESTOCK"
+
+  echo "    - Replaced 1011 -> ${MASK}"
+  echo "    - Commented FAUBI lines for livestock ${LIVESTOCK} in ${HEMCO_RC_REL}"
+done
+
+echo
+echo "SUCCESS: Created country ensemble directories under: ${ENSEMBLE_DIR}"

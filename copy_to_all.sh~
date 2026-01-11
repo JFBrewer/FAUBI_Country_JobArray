@@ -1,0 +1,25 @@
+#!/bin/bash
+
+# Directory containing all subdirectories
+PARENT_DIR="ensemble"
+
+# The directory that contains the source file
+SOURCE_DIR="001_Bangladesh_Checksum"
+
+# File to copy
+FILE_NAME="OutputDir"
+
+# Full path to source file
+SRC="${PARENT_DIR}/${SOURCE_DIR}/${FILE_NAME}"
+
+# Loop over all directories in parent
+for d in "${PARENT_DIR}"/*/; do
+    # Skip the SOURCE_DIR
+    if [[ "$d" == "${PARENT_DIR}/${SOURCE_DIR}/" ]]; then
+        continue
+    fi
+
+    # Copy file (overwrite if exists)
+    echo "Copying to $d"
+    cp -r "$SRC" "$d"
+done

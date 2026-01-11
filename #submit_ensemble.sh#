@@ -1,0 +1,155 @@
+]#!/usr/bin/env bash
+# Submit 2015 monthly chains for each rundir in ensemble/.
+# Resumes automatically by skipping months with RUN_DIR/.month_done/YYYYMM.done
+# Logs: ensemble/logs/%x.%j.out and .err
+
+set -euo pipefail
+
+BASE="${HOME}/scratch/GC_Rundirs/FAUBI_2x25_Country_JobArray"
+ENSEMBLE_DIR="${BASE}/ensemble"
+LOGDIR="${ENSEMBLE_DIR}/logs"
+SBATCH_FILE="${BASE}/run_month.sbatch"   # path to the sbatch job script
+
+# Span (edit as needed)
+YEAR=2015
+START_MONTH=1
+END_MONTH=12
+
+# --- helpers ---
+ymd_first() { printf "%04d%02d01" "$1" "$2"; }
+next_month_first() {
+  local ymd="$1"
+  if date --version >/dev/null 2>&1; then
+    date -d "${ymd:0:4}-${ymd:4:2}-01 +1 month" +%Y%m01
+  else
+    python - <<PY
+from datetime import date
+y=int("$ymd"[0:4]); m=int("$ymd"[4:6])
+if m==12: y+=1; m=1
+else: m+=1
+print(f"{y:04d}{m:02d}01")
+PY
+  fi
+}
+
+usage() {
+  cat <<EOF
+Usage: $0 [--force]
+
+Options:
+  --force    Re-submit all months even if .month_done/YYYYMM.done exists.
+
+Notes:
+- Logs are written to: ${LOGDIR}/%x.%j.out and .err
+- A month is considered complete if RUN_DIR/.month_done/YYYYMM.done exists.
+EOF
+}
+
+FORCE=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --force) FORCE=1; shift;;
+    -h|--help) usage; exit 0;;
+    *) echo "Unknown arg: $1" >&2; usage; exit 1;;
+  esac
+done
+
+# --- preflight ---
+mkdir -p "$LOGDIR"
+
+if [[ ! -d "$ENSEMBLE_DIR" ]]; then
+  echo "ERROR: ensemble dir not found: $ENSEMBLE_DIR" >&2; exit 1
+fi
+if [[ ! -f "$SBATCH_FILE" ]]; then
+  echo "ERROR: sbatch runner not found: $SBATCH_FILE" >&2; exit 1
+fi
+if (( START_MONTH < 1 || END_MONTH > 12 || START_MONTH > END_MONTH )); then
+  echo "ERROR: invalid month range ${START_MONTH}..${END_MONTH}" >&2; exit 1
+fi
+
+# Discover rundirs
+mapfile -t RUN_DIRS < <(find "$ENSEMBLE_DIR" -maxdepth 1 -mindepth 1 -type d -printf "%f\n" 2>/dev/null | sort -V)
+# BSD fallback if -printf is unavailable
+if [[ ${#RUN_DIRS[@]} -eq 0 ]]; then
+  mapfile -t RUN_DIRS < <(find "$ENSEMBLE_DIR" -maxdepth 1 -mindepth 1 -type d | sed 's|.*/||' | sort -V)
+fi
+(( ${#RUN_DIRS[@]} > 0 )) || { echo "ERROR: no rundirs found in $ENSEMBLE_DIR"; exit 1; }
+
+echo "Submitting chains for ${#RUN_DIRS[@]} rundirs."
+echo "Logs: ${LOGDIR}/%x.%j.{out,err}"
+echo "Force: $FORCE"
+echo
+
+# --- submit per rundir ---
+for rd in "${RUN_DIRS[@]}"; do
+
+  # Skip the log directory if it appears in RUN_DIRS
+  if [[ "$rd" == "$LOGDIR" || "$rd" == "$(basename "$LOGDIR")" ]]; then
+    echo "Skipping log directory: $rd"
+    continue
+  fi
+    
+  RUN_PATH="${ENSEMBLE_DIR}/${rd}"
+  TAG="${rd#???_}"; [[ "$TAG" == "$rd" ]] && TAG="$rd"   # e.g., 001_Bf_NH3 -> Bf_NH3
+
+  echo "== Rundir: $rd =="
+
+  prev_jid=""
+  submitted=0
+
+  # Build month list and skip completed (unless --force)
+  start="$(ymd_first "$YEAR" "$START_MONTH")"
+  end="$(next_month_first "$start")"
+
+  for (( m=START_MONTH; m<=END_MONTH; m++ )); do
+    if (( m > START_MONTH )); then
+      start="$end"
+      end="$(next_month_first "$start")"
+    fi
+
+    ym="${start:0:6}"   # YYYYMM
+    done_mark="${RUN_PATH}/.month_done/${ym}.done"
+
+    if (( FORCE == 0 )) && [[ -f "$done_mark" ]]; then
+      echo "  - SKIP  ${ym} (marker exists: $(basename "$done_mark"))"
+      continue
+    fi
+
+    jobname="FAUBI_${TAG}_m$(printf "%02d" "$m")"
+    export_vars="RUN_DIR=${RUN_PATH},START=${start},END=${end},YEAR_MONTH=${ym}"
+
+    # Ensure logs directory exists before sbatch evaluates paths
+    mkdir -p "$LOGDIR"
+
+    if [[ -z "$prev_jid" ]]; then
+      jid=$(sbatch \
+        --parsable \
+        --job-name "$jobname" \
+        --output "${LOGDIR}/%x.%j.out" \
+        --error  "${LOGDIR}/%x.%j.err" \
+        --export=ALL,"$export_vars" \
+        "$SBATCH_FILE")
+    else
+      jid=$(sbatch \
+        --parsable \
+        --job-name "$jobname" \
+        --output "${LOGDIR}/%x.%j.out" \
+        --error  "${LOGDIR}/%x.%j.err" \
+        --dependency=afterok:${prev_jid} \
+        --export=ALL,"$export_vars" \
+        "$SBATCH_FILE")
+    fi
+
+    echo "  - SUBMIT ${ym}: JOBID=${jid}   START=${start} END=${end}"
+    prev_jid="$jid"
+    submitted=$((submitted + 1))
+    sleep 0.1
+  done
+
+  if (( submitted == 0 )); then
+    echo "  * Nothing to submit (all months complete or out of range)."
+  fi
+  echo
+done
+
+echo "Done submitting."
