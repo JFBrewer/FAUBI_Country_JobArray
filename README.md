@@ -1,2 +1,2 @@
 # FAUBI_Country_JobArray
-These scripts allow the construction of a large GEOS-Chem ensemble set based on a single template run directory, to test emissions from a large number of countries.
+These scripts allow the construction of a large GEOS-Chem ensemble set based on a single template run directory, to test emissions from a large number of countries. They require a specific run manifest, and a template/HEMCO_Config.rc set up in a specific manner. However, the basic formulation could easily be used by anyone to create a different but analogous ensemble of GEOS-Chem model runs.
